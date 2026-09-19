@@ -32,6 +32,10 @@ type nativeGamepadsIOKit struct {
 	devicesToAdd    []_IOHIDDeviceRef
 	devicesToRemove []_IOHIDDeviceRef
 	devicesMu       sync.Mutex
+
+	// devicesDeferredToGC holds the devices the GameController backend claimed. GameController
+	// drops the ones it can only present as a micro gamepad, and those are reclaimed here.
+	devicesDeferredToGC []_IOHIDDeviceRef
 }
 
 // theIOKitGamepads is the running IOKit backend. The C device callbacks reference
@@ -152,10 +156,34 @@ func (g *nativeGamepadsIOKit) update(gamepads *gamepads) error {
 			n, ok := gp.native.(*nativeGamepadHID)
 			return ok && n.device == device
 		})
+		g.devicesDeferredToGC = slices.DeleteFunc(g.devicesDeferredToGC, func(d _IOHIDDeviceRef) bool {
+			return d == device
+		})
 	}
 	g.devicesToAdd = g.devicesToAdd[:0]
 	g.devicesToRemove = g.devicesToRemove[:0]
+
+	if gcDroppedController.Swap(false) {
+		g.reclaimDevicesFromGC(gamepads)
+	}
 	return nil
+}
+
+// reclaimDevicesFromGC adds the deferred devices the GameController backend turned out not to
+// register. A device is left deferred while a GameController gamepad reports the same name, which
+// is how a device GameController does drive is told apart from one it dropped.
+func (g *nativeGamepadsIOKit) reclaimDevicesFromGC(gamepads *gamepads) {
+	g.devicesDeferredToGC = slices.DeleteFunc(g.devicesDeferredToGC, func(device _IOHIDDeviceRef) bool {
+		name := hidDeviceName(device)
+		if gamepads.find(func(gp *Gamepad) bool {
+			_, ok := gp.native.(*nativeGamepadGC)
+			return ok && gp.name == name
+		}) != nil {
+			return false
+		}
+		g.addHIDDevice(device, gamepads)
+		return true
+	})
 }
 
 // hidDeviceProperty returns the device's property for the given null-terminated key name.
@@ -169,13 +197,34 @@ func hidDeviceProperty(device _IOHIDDeviceRef, key []byte) _CFTypeRef {
 	return _IOHIDDeviceGetProperty(device, keyRef)
 }
 
+// hidDeviceName returns the device's product name, or "Unknown" if it has none.
+func hidDeviceName(device _IOHIDDeviceRef) string {
+	prop := hidDeviceProperty(device, kIOHIDProductKey)
+	if prop == 0 {
+		return "Unknown"
+	}
+	var cstr [256]byte
+	if !_CFStringGetCString(_CFStringRef(prop), cstr[:], _CFIndex(len(cstr)), kCFStringEncodingUTF8) {
+		return "Unknown"
+	}
+	return strings.TrimRight(string(cstr[:]), "\x00")
+}
+
 func (g *nativeGamepadsIOKit) addDevice(device _IOHIDDeviceRef, gamepads *gamepads) {
 	// Let the GameController backend own the controllers it supports; IOKit handles
-	// only the devices GameController does not enumerate.
+	// only the devices GameController does not enumerate. The claim is not final: GameController
+	// exposes some HID pads as micro gamepads and then drops them, so keep the device around
+	// until the connect notification says which way it went.
 	if gcSupportsHIDDevice(device) {
+		g.devicesDeferredToGC = append(g.devicesDeferredToGC, device)
 		return
 	}
 
+	g.addHIDDevice(device, gamepads)
+}
+
+// addHIDDevice registers a device with the IOKit backend, whatever GameController makes of it.
+func (g *nativeGamepadsIOKit) addHIDDevice(device _IOHIDDeviceRef, gamepads *gamepads) {
 	if gamepads.find(func(gp *Gamepad) bool {
 		n, ok := gp.native.(*nativeGamepadHID)
 		return ok && n.device == device
@@ -191,13 +240,7 @@ func (g *nativeGamepadsIOKit) addDevice(device _IOHIDDeviceRef, gamepads *gamepa
 	}
 	defer _CFRelease(_CFTypeRef(elements))
 
-	name := "Unknown"
-	if prop := hidDeviceProperty(device, kIOHIDProductKey); prop != 0 {
-		var cstr [256]byte
-		if _CFStringGetCString(_CFStringRef(prop), cstr[:], _CFIndex(len(cstr)), kCFStringEncodingUTF8) {
-			name = strings.TrimRight(string(cstr[:]), "\x00")
-		}
-	}
+	name := hidDeviceName(device)
 
 	var vendor uint32
 	if prop := hidDeviceProperty(device, kIOHIDVendorIDKey); prop != 0 {

@@ -16,6 +16,7 @@ package gamepad
 
 import (
 	"encoding/hex"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -543,6 +544,10 @@ func getControllerStateGC(controllerPtr uintptr, buttonMask uint32, nHats int,
 func addController(controller objc.ID) {
 	// Ignore if the controller is not an actual controller (e.g., Siri Remote).
 	if controller.Send(sel_extendedGamepad) == 0 && controller.Send(sel_microGamepad) != 0 {
+		// GameController also reports plain USB HID pads as micro gamepads. The IOKit backend
+		// stepped aside for this device because +[GCController supportsHIDDevice:] claimed it,
+		// so tell IOKit the claim came to nothing.
+		gcDroppedController.Store(true)
 		return
 	}
 
@@ -556,6 +561,10 @@ func addController(controller objc.ID) {
 		prop:       prop,
 	})
 }
+
+// gcDroppedController reports whether a controller GameController claimed has been dropped as
+// unusable since the IOKit backend last looked. IOKit then reclaims the devices it deferred.
+var gcDroppedController atomic.Bool
 
 // removeController queues a GCController to be unregistered by the next update.
 func removeController(controller objc.ID) {
